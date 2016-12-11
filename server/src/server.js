@@ -6,6 +6,8 @@ var app = express();
 var bodyParser = require('body-parser');
 var StatusUpdateSchema = require('./schemas/statusupdate.json');
 var CommentSchema = require('./schemas/comment.json');
+var UserSchema = require('./schemas/user.json');
+var LoginSchema = require('./schemas/login.json');
 var validate = require('express-jsonschema').validate;
 var mongo_express = require('mongo-express/lib/middleware');
 // Use default Mongo Express configuration
@@ -14,6 +16,9 @@ var MongoClient = require('mongodb').MongoClient;
 var ObjectID = require('mongodb').ObjectID;
 var ResetDatabase = require('./resetdatabase');
 var url = 'mongodb://localhost:27017/facebook';
+var bcrypt = require('bcryptjs');
+var jwt = require('jsonwebtoken');
+var secretKey = "7d672134-7365-40d8-acd6-ca6a82728471";
 
 /**
  * Strips a password from a user object.
@@ -179,29 +184,31 @@ MongoClient.connect(url, function(err, db) {
   }
 
   /**
-   * Get the user ID from a token. Returns "" (an invalid ID) if it fails.
-   */
-  function getUserIdFromToken(authorizationLine) {
-    try {
-      // Cut off "Bearer " from the header value.
-      var token = authorizationLine.slice(7);
-      // Convert the base64 string to a UTF-8 string.
-      var regularString = new Buffer(token, 'base64').toString('utf8');
-      // Convert the UTF-8 string into a JavaScript object.
-      var tokenObj = JSON.parse(regularString);
-      var id = tokenObj['id'];
-      // Check that id is a string.
-      if (typeof id === 'string') {
-        return id;
-      } else {
-        // Not a number. Return "", an invalid ID.
+     * Get the user ID from a token.
+     * Returns "" (an invalid ID) if it fails.
+     */
+    function getUserIdFromToken(authorizationLine) {
+      try {
+        // Cut off "Bearer " from the header value.
+        var token = authorizationLine.slice(7);
+        // Verify the token. Throws if the token is invalid or expired.
+        var tokenObj = jwt.verify(token, secretKey);
+        var id = tokenObj['id'];
+        // Check that id is a string.
+        if (typeof id === 'string') {
+          return id;
+        } else {
+          // Not a string. Return "", an invalid ID.
+          // This should technically be impossible unless
+          // the server accidentally
+          // generates a token with a number for an id!
+          return "";
+        }
+      } catch (e) {
+        // Return an invalid ID.
         return "";
       }
-    } catch (e) {
-      // Return an invalid ID.
-      return "";
     }
-  }
 
   /**
    * Get the feed data for a particular user.
@@ -693,6 +700,131 @@ MongoClient.connect(url, function(err, db) {
     });
   });
 
+  app.post('/user',validate({body:UserSchema}),function(req,res) {
+    console.log("Sign up");
+    var user = req.body;
+    var password = user.password;
+    // Standardize the email to be lower-cased and free of
+    // extraneous whitespace. A production server would
+    // actually check that the email is formatted
+    // properly, and would send a verification email!
+    user.email = user.email.trim().toLowerCase();
+    if (password.length < 5) {
+      // Bad request
+      res.status(400).end()
+    }
+    // bcrypt.hash will generate a salt for us and
+    // hash the password with the salt
+    bcrypt.hash(password, 10, function(err,hash) {
+      if (err) {
+        // bcrypt had some sort of error!
+        console.log("Get error when hashing");
+        return res.status(500).end();
+      } else {
+        // Replace the plaintext password with the
+        // salt+hash string that bcrypt gave us.
+        user.password = hash;
+        // Create a new user
+        console.log("inserting user");
+        db.collection('users').insertOne(user, function(err, result) {
+          if (err) {
+            // This will happen if there's already a
+            // user with the same email address.
+            console.log("Get error when insert user");
+            return sendDatabaseError(res, err);
+          }
+          var userId = result.insertedId;
+          // Create the user's feed.
+          console.log("inserting feed");
+          db.collection('feeds').insertOne({
+            contents: []
+          }, function(err, result) {
+            if (err) {
+              // In a production app, we'd probably
+              // also want to remove the user
+              // we just created if this fails.
+              console.log("Get error when insert feed");
+              return sendDatabaseError(res, err);
+            }
+
+            // Update the user document with the new feed's ID.
+            var feedId = result.insertedId;
+            // Set the reference for the user's feed.
+            console.log("updating user");
+            db.collection('users').updateOne({
+              _id: userId
+            }, {
+              $set: {
+                feed: feedId
+              }
+            }, function(err) {
+              if (err) {
+                console.log("Get error when update user");
+                return sendDatabaseError(res, err);
+              }
+              // Send a blank response to indicate success!
+              console.log("Sending result back");
+              res.send();
+            })
+          });
+        });
+        }
+      });
+    });
+
+  app.post('/login', validate({body:LoginSchema}),
+    function(req,res) {
+      var loginData = req.body;
+      var pw = loginData.password;
+      // Get the user with the given email address.
+      // Standardize the email address before searching.
+      var email = loginData.email.trim().toLowerCase();
+      db.collection('users').findOne({email:email}, function(err,user) {
+        if (err) {
+          sendDatabaseError(err);
+        } else if (user === null){
+          // No user found with given email address.
+          // 401 Unauthorized is the correct code to use in this case.
+          res.status(401).end();
+        } else {
+          // Use bcrypt to check the password against the
+          // recorded hash and salt. Note that user.password
+          // in the database contains a string with both the
+          // hash and salt -- this is why bcrypt is incredibly
+          // easy to use!
+          bcrypt.compare(pw,user.password,function(err, success) {
+            if (err) {
+              // An internal error occurred. This could only possibly
+              // happen if the recorded hash+salt in the database is
+              // malformed, or bcryptjs has a bug.
+              res.status(500).end()
+            } else if (success){
+              // Successful login!
+              // Create a token that is valid for a week.
+              jwt.sign({
+                id:user._id
+              },secretKey,{ expiresIn: "7 days"},
+                function(token) {
+                  // We have the token.
+                  // Remove the 'password' field from the user
+                  // document before sending it to the client.
+                  stripPassword(user);
+                  // Send the user document and the token to the client.
+                  console.log("logged in!");
+                  console.log(user);
+                  res.status(201).send( {
+                    user:user,
+                    token: token
+                  });
+                });
+            } else {
+              // Invalid password; 'success' was false.
+              res.status(400).end();
+            }
+          });
+        }
+      });
+    });
   /**
    * Translate JSON Schema Validation failures into error 400s.
    */
